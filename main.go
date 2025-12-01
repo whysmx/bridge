@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	portA = ":9001"
-	portB = ":9002"
+	portA = ":1024"
+	portB = ":1025"
 
 	// 0 代表不设读空闲超时，仅依赖 TCP keepalive 检测半开
 	readIdleTimeout = 0
