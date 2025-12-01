@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +26,11 @@ const (
 	queueCapacity      = 1024
 	maxChunkBytes      = 4 * 1024
 	tcpKeepAlivePeriod = 30 * time.Second
+
+	historyRetention    = 10 * time.Minute
+	historyMaxEntries   = 2000
+	payloadSampleLimit  = 256
+	historyCleanupEvery = 1 * time.Minute
 )
 
 var sessionSeq uint64
@@ -110,10 +117,14 @@ type session struct {
 
 	onAClose func(net.Conn)
 	onBClose func(net.Conn)
+
+	history *trafficHistory
 }
 
 func newSession(onAClose, onBClose func(net.Conn)) *session {
 	ctx, cancel := context.WithCancel(context.Background())
+	hist := &trafficHistory{}
+	hist.startCleanup(ctx)
 	s := &session{
 		id:       atomic.AddUint64(&sessionSeq, 1),
 		qAB:      make(chan []byte, queueCapacity),
@@ -122,12 +133,13 @@ func newSession(onAClose, onBClose func(net.Conn)) *session {
 		cancel:   cancel,
 		onAClose: onAClose,
 		onBClose: onBClose,
+		history:  hist,
 	}
 
-	go s.readerLoop("A", s.getA, s.onAClose, s.qAB)
+	go s.readerLoop("A", "A->B", s.getA, s.onAClose, s.qAB)
 	go s.writerLoop("B", s.getB, s.qAB)
 
-	go s.readerLoop("B", s.getB, s.onBClose, s.qBA)
+	go s.readerLoop("B", "B->A", s.getB, s.onBClose, s.qBA)
 	go s.writerLoop("A", s.getA, s.qBA)
 
 	return s
@@ -159,7 +171,7 @@ func (s *session) getB() net.Conn {
 
 // readerLoop 只由 session 持有，避免与其他 goroutine 抢读。
 // queue 满则丢弃新数据，不断开连接。
-func (s *session) readerLoop(role string, getConn func() net.Conn, onClose func(net.Conn), q chan<- []byte) {
+func (s *session) readerLoop(role, dir string, getConn func() net.Conn, onClose func(net.Conn), q chan<- []byte) {
 	buf := make([]byte, maxChunkBytes)
 
 	for {
@@ -183,6 +195,7 @@ func (s *session) readerLoop(role string, getConn func() net.Conn, onClose func(
 		if n > 0 {
 			cp := make([]byte, n)
 			copy(cp, buf[:n])
+			s.history.record(dir, cp)
 
 			select {
 			case q <- cp:
@@ -280,4 +293,87 @@ func main() {
 	<-sig
 	log.Println("shutting down...")
 	br.sess.cancel()
+}
+
+type trafficEntry struct {
+	ts     time.Time
+	dir    string
+	size   int
+	sample string
+}
+
+type trafficHistory struct {
+	mu      sync.Mutex
+	entries []trafficEntry
+}
+
+func (h *trafficHistory) record(dir string, data []byte) {
+	sample := formatSample(data)
+	entry := trafficEntry{
+		ts:     time.Now(),
+		dir:    dir,
+		size:   len(data),
+		sample: sample,
+	}
+
+	h.mu.Lock()
+	h.entries = append(h.entries, entry)
+	if len(h.entries) > historyMaxEntries {
+		h.entries = h.entries[len(h.entries)-historyMaxEntries:]
+	}
+	h.mu.Unlock()
+
+	log.Printf("[traffic][%s] %d bytes: %s", dir, len(data), sample)
+}
+
+func (h *trafficHistory) startCleanup(ctx context.Context) {
+	ticker := time.NewTicker(historyCleanupEvery)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.cleanup()
+			}
+		}
+	}()
+}
+
+func (h *trafficHistory) cleanup() {
+	cutoff := time.Now().Add(-historyRetention)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	idx := 0
+	for idx < len(h.entries) && h.entries[idx].ts.Before(cutoff) {
+		idx++
+	}
+	if idx > 0 {
+		h.entries = append([]trafficEntry{}, h.entries[idx:]...)
+	}
+	if len(h.entries) > historyMaxEntries {
+		h.entries = h.entries[len(h.entries)-historyMaxEntries:]
+	}
+}
+
+func formatSample(data []byte) string {
+	n := len(data)
+	if n > payloadSampleLimit {
+		n = payloadSampleLimit
+	}
+	sample := data[:n]
+
+	printable := true
+	for _, b := range sample {
+		if b < 32 || b > 126 {
+			printable = false
+			break
+		}
+	}
+	if printable {
+		return string(sample)
+	}
+	return strings.ToUpper(hex.EncodeToString(sample))
 }
