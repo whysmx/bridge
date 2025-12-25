@@ -9,26 +9,73 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: .exe
+          - os: windows-latest
+            goos: windows
+            goarch: 386
+            ext: .exe
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            ext: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go (Windows 7 compatible toolchain)
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.20.14"
+          go-version: "1.20"
 
       - name: Build
         shell: pwsh
+        if: runner.os == 'Windows'
         run: |
-          go env
-          go build -trimpath -ldflags "-s -w" -o bridge.exe .
+          $env:GOOS="${{ matrix.goos }}"
+          $env:GOARCH="${{ matrix.goarch }}"
+          $env:CGO_ENABLED="0"
+          go build -trimpath -ldflags "-s -w" -o bridge${{ matrix.ext }} .
+
+      - name: Build (Linux)
+        if: runner.os != 'Windows'
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bridge${{ matrix.ext }} .
+
+      - name: Rename for release
+        run: |
+          mv bridge${{ matrix.ext }} bridge-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          path: bridge-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: bridge.exe
+          files: artifacts/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
